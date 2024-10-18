@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import logging
-from typing import List, Union
+from typing import Any, List, Union
 
 import torch
 import torch.fx as fx
@@ -207,7 +207,7 @@ def tensorify_python_scalars(
 
             # Look for functions to convert
             if node.op == "call_function" and node.target in SUPPORTED_OPS:
-                args = []
+                args: List[Any] = []
                 transform = False
                 compute_dtype = get_computation_dtype(node.meta["val"].dtype)
 
@@ -230,8 +230,10 @@ def tensorify_python_scalars(
                             )
 
                         args.append(proxy)
-                    else:
+                    elif isinstance(a, fx.Node):
                         args.append(MetaProxy(a, tracer=tracer, fake_mode=fake_mode))
+                    else:
+                        args.append(a)
 
                 if transform:
                     replacement_proxy = node.target(*args)
@@ -247,6 +249,42 @@ def tensorify_python_scalars(
                     node.replace_all_uses_with(replacement_proxy.node)
 
                     graph.erase_node(node)
+
+    # Now do one more pass that specializes all symfloats we didn't manage
+    # to tensorify away.
+    nodes = list(graph.nodes)
+    for i, node in enumerate(nodes[:-1]):
+        with graph.inserting_before(
+            nodes[i + 1] if node not in placeholders else first_non_placeholder
+        ):
+            args = []
+            transform = False
+            for a in node.args:
+                if isinstance(a, fx.Node) and isinstance(
+                    zf := a.meta["val"], torch.SymFloat
+                ):
+                    transform = True
+                    args.append(float(zf))
+                elif isinstance(a, fx.Node):
+                    args.append(MetaProxy(a, tracer=tracer, fake_mode=fake_mode))
+                else:
+                    args.append(a)
+
+            if transform:
+                # I originally tried using MetaProxy here but it gets pretty gnarly
+                # when you try transforming a function that only takes in a non
+                # MetaProxy argument like a bare float. eg. If you have a scalar_tensor_default
+                # call. If you do something like res = node.target(*args, **node.kwargs) where
+                # node.target = <OpOverload(op='aten.scalar_tensor', overload='default')> and
+                # args = [0.01], res will actually be a FakeTensor and not a node or proxy as
+                # you would expect.
+                replacement_node = graph.call_function(
+                    node.target, tuple(args), node.kwargs
+                )
+                with fake_mode:
+                    replacement_node.meta["val"] = node.target(*args, **node.kwargs)
+                node.replace_all_uses_with(replacement_node)
+                graph.erase_node(node)
 
     # DCE symbols (which are guaranteed to be pure) only
     for proxy in reversed(expr_to_sym_proxy.values()):
